@@ -1,0 +1,101 @@
+Loading data...
+Processing 2417 examples
+Loading intervention outcomes...
+
+Generating traces with TracingMultiHopQA...
+Loading DeBERTa from models/deberta_fg_v2_best...
+Loading weights:   0%|          | 0/394 [00:00<?, ?it/s]Loading weights: 100%|██████████| 394/394 [00:00<00:00, 5238.71it/s]
+  Model loaded on cpu
+  100/2417: 68 traces, 176 API calls, 32 skipped
+  150/2417: 98 traces, 247 API calls, 52 skipped
+  450/2417: 270 traces, 660 API calls, 180 skipped
+  500/2417: 310 traces, 750 API calls, 190 skipped
+  550/2417: 342 traces, 828 API calls, 208 skipped
+  600/2417: 381 traces, 916 API calls, 219 skipped
+  650/2417: 411 traces, 982 API calls, 239 skipped
+  750/2417: 467 traces, 1114 API calls, 283 skipped
+  850/2417: 518 traces, 1233 API calls, 332 skipped
+  900/2417: 553 traces, 1300 API calls, 347 skipped
+  1000/2417: 632 traces, 1506 API calls, 368 skipped
+  1050/2417: 661 traces, 1577 API calls, 389 skipped
+  1150/2417: 725 traces, 1730 API calls, 425 skipped
+  1250/2417: 784 traces, 1861 API calls, 466 skipped
+  1300/2417: 826 traces, 1970 API calls, 474 skipped
+  1350/2417: 863 traces, 2071 API calls, 487 skipped
+  1400/2417: 886 traces, 2157 API calls, 514 skipped
+  1450/2417: 926 traces, 2274 API calls, 524 skipped
+  1500/2417: 969 traces, 2403 API calls, 531 skipped
+  1600/2417: 1029 traces, 2599 API calls, 571 skipped
+  1650/2417: 1064 traces, 2700 API calls, 586 skipped
+  1800/2417: 1145 traces, 2922 API calls, 655 skipped
+  2000/2417: 1247 traces, 3252 API calls, 753 skipped
+  2050/2417: 1264 traces, 3317 API calls, 786 skipped
+  2100/2417: 1292 traces, 3422 API calls, 808 skipped
+  2150/2417: 1324 traces, 3542 API calls, 826 skipped
+  2200/2417: 1354 traces, 3648 API calls, 846 skipped
+  2250/2417: 1388 traces, 3751 API calls, 862 skipped
+  2300/2417: 1415 traces, 3824 API calls, 885 skipped
+  2350/2417: 1442 traces, 3896 API calls, 908 skipped
+
+Saved 1477 traces to results/selfask_traces_v3.json
+API calls: 3991, Skipped: 940
+
+Building SFT data from 1477 traces...
+Total SFT examples: 654
+  From correct baselines: 654
+  From successful interventions: 0
+  Skipped (neither correct at generation time): 823
+
+Token stats:
+  Total: ~1,281,760
+  Avg: ~1,959
+  Max: ~9,146
+  Est. fine-tuning cost: ~$10.25
+
+Train: 524 -> results/sft_v3_train.jsonl
+Val: 130 -> results/sft_v3_val.jsonl
+
+============================================================
+EXAMPLE (first 2 turns):
+============================================================
+
+--- USER ---
+You are answering a multi-hop question that may require multiple pieces of information.
+Question: How many episodes are in season 5 of the series with The Bag or the Bat?
+Retrieved Information:
+[1] The Bag or the Bat: "The Bag or the Bat" is the pilot episode of the Showtime original series "Ray Donovan", and premiered on June 30, 2013. The series premiere was directed by Allen Coulter and written
+...
+
+--- ASSISTANT ---
+SEARCH: Ray Donovan season 5 number of episodes  
+REASONING: The retrieved information confirms "The Bag or the Bat" is the pilot episode of Ray Donovan, but does not provide the number of episodes in season 5. I need to find the episode count for Ray Donovan season 5.
+
+--- USER ---
+You are answering a multi-hop question that may require multiple pieces of information.
+Question: How many episodes are in season 5 of the series with The Bag or the Bat?
+Retrieved Information:
+[1] The Bag or the Bat: "The Bag or the Bat" is the pilot episode of the Showtime original series "Ray Donovan", and premiered on June 30, 2013. The series premiere was directed by Allen Coulter and written
+...
+
+--- ASSISTANT ---
+ANSWER: Season 5 of Ray Donovan has 12 episodes.
+
+============================================================
+NEXT STEPS:
+============================================================
+
+1. Upload and fine-tune:
+   python -c "
+from openai import OpenAI
+c = OpenAI()
+train = c.files.create(file=open('results/sft_v3_train.jsonl','rb'), purpose='fine-tune')
+val = c.files.create(file=open('results/sft_v3_val.jsonl','rb'), purpose='fine-tune')
+job = c.fine_tuning.jobs.create(
+    training_file=train.id, validation_file=val.id,
+    model='gpt-4.1-mini-2025-04-14', suffix='fact-aware-v3'
+)
+print(f'Job: {job.id}, Status: {job.status}')
+"
+
+2. Evaluate with sft_evaluate.py (update FT_MODEL to new model ID)
+
