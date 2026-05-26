@@ -7,7 +7,7 @@ SimpleMultiHopQA generates — exactly matching inference format.
 Uses existing intervention outcomes to select winning traces.
 Generates traces by running the actual pipeline (costs API calls).
 
-Run on VM: cd ~/ircot && python generate_sft_data_v3.py
+Run on VM: cd ~/ircot && python generate_sft_data.py
 """
 import json
 import sys

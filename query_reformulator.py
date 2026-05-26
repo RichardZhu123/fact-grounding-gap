@@ -1,26 +1,37 @@
-#!/usr/bin/env python3
+«#!/usr/bin/env python3
 """
-Part 2 (v3): Query Reformulator without failed-passage context.
+Query Reformulation Helper
 
-Takes the original full question + current sub-question and generates a
-disambiguated search query. Does NOT use failed passages as context, to
-avoid entity poisoning (where the reformulator copies wrong entities from
-the failed retrievals into the new query).
+When DeBERTa flags a hop as NOT-ANSWERABLE, this module asks GPT-4.1-mini
+to generate a more targeted search query that addresses the missing fact.
+
+Usage as a module:
+    from query_reformulator import QueryReformulator
+    reformulator = QueryReformulator()
+    new_query = reformulator.reformulate(sub_question, failed_passages)
+
+Standalone test:
+    python query_reformulator.py
 """
 
-import os
+import time
 from openai import OpenAI
 
 
-REFORMULATION_PROMPT = """The original multi-hop question is: "{original_question}"
-The current sub-question to search for is: "{sub_question}"
+REFORMULATION_PROMPT = """You are helping a multi-hop question answering system.
+A retrieval step failed: the retrieved passages do not contain the information needed
+to answer this sub-question. Generate a better, more targeted search query.
 
-Generate a SHORT search query (3-8 words) that focuses ONLY on what the sub-question asks.
-Do NOT include words from other parts of the original question that aren't relevant to
-this specific sub-question. Add DISTINCTIVE disambiguators (years, domain terms, alternate
-names, proper nouns) that distinguish the correct entity from common name collisions.
+Sub-question: {sub_question}
 
-Output ONLY the new search query, nothing else."""
+Retrieved passages (which DO NOT answer the sub-question):
+{passages}
+
+Analyze why the retrieval failed (e.g., wrong entity disambiguation, missing key term,
+too vague, etc.) and produce a SHORT search query (3-8 words) that would better target
+the specific fact needed. Focus on the key entity and relation.
+
+Output ONLY the new search query, nothing else. No quotes, no explanation."""
 
 
 class QueryReformulator:
@@ -28,54 +39,65 @@ class QueryReformulator:
         self.client = OpenAI()
         self.model = model
 
-    def reformulate(self, original_question: str, sub_question: str, failed_passages=None) -> str:
-        """
-        Generate a focused search query for the given sub-question.
-
-        failed_passages parameter is kept for backwards compatibility with
-        older callers but is intentionally NOT passed to the LLM, to prevent
-        entity poisoning from incorrect retrievals.
-        """
+    def reformulate(self, sub_question: str, failed_passages: str, max_retries: int = 3) -> str:
+        """Generate a better search query for a failed retrieval."""
+        # Truncate passages to keep prompt size reasonable
+        passages_truncated = failed_passages[:2000]
         prompt = REFORMULATION_PROMPT.format(
-            original_question=original_question,
             sub_question=sub_question,
+            passages=passages_truncated,
         )
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=50,
-        )
-        return resp.choices[0].message.content.strip().strip('"').strip("'")
+
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=50,
+                )
+                new_query = response.choices[0].message.content.strip()
+                # Strip quotes if present
+                new_query = new_query.strip('"').strip("'")
+                return new_query
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    # Fallback: return original sub-question
+                    return sub_question
+
+        return sub_question
+
+
+def main():
+    """Test reformulation on a few examples."""
+    reformulator = QueryReformulator()
+
+    test_cases = [
+        {
+            "sub_question": "Which company distributed UHF?",
+            "passages": "[1] UHF: UHF refers to ultra-high frequency radio waves between 300 MHz and 3 GHz. Used for TV, cell phones, satellites.\n[2] World Film Company: A film production company organized in 1914.",
+        },
+        {
+            "sub_question": "Who is the spouse of Steve Hillage?",
+            "passages": "[1] Gong (band): Gong is a rock band founded by Daevid Allen in 1967. Steve Hillage joined as guitarist in 1973.",
+        },
+        {
+            "sub_question": "Where was Trey Parker born?",
+            "passages": "[1] South Park: South Park is an American animated sitcom created by Trey Parker and Matt Stone. Premiered August 13, 1997.",
+        },
+    ]
+
+    print("Testing query reformulation:\n")
+    for i, case in enumerate(test_cases, 1):
+        print(f"--- Test {i} ---")
+        print(f"Original sub-question: {case['sub_question']}")
+        print(f"Failed passages: {case['passages'][:200]}...")
+        new_query = reformulator.reformulate(case['sub_question'], case['passages'])
+        print(f"Reformulated query: {new_query}")
+        print()
 
 
 if __name__ == "__main__":
-    r = QueryReformulator()
-
-    print("=== Test 1: Green step 1 (was previously poisoned by Joni Mitchell passages) ===")
-    q = r.reformulate(
-        original_question="Who is the spouse of the Green performer?",
-        sub_question="Who is the performer of Green?",
-    )
-    print(f"Query: {q}\n")
-
-    print("=== Test 2: Steve Hillage step 2 ===")
-    q = r.reformulate(
-        original_question="Who is the spouse of the Green performer?",
-        sub_question="Who is the spouse of Steve Hillage?",
-    )
-    print(f"Query: {q}\n")
-
-    print("=== Test 3: UHF step 1 (sanity check) ===")
-    q = r.reformulate(
-        original_question="Who founded the company that distributed the film UHF?",
-        sub_question="Which company distributed UHF?",
-    )
-    print(f"Query: {q}\n")
-
-    print("=== Test 4: Orion Pictures step 2 (bridge entity) ===")
-    q = r.reformulate(
-        original_question="Who founded the company that distributed the film UHF?",
-        sub_question="Who founded Orion Pictures?",
-    )
-    print(f"Query: {q}\n")
+    main()

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Section 4: Augmentation with cross-encoder reranking on flagged hops.
-Flagged hops: retrieve k=20, rerank with cross-encoder, select top-3.
-Unflagged hops: keep k=3 original.
-Same 4 conditions, cap=12.
+Section 4: Refined reranking — all hops get reranked, flagged hops get deeper retrieval.
+Unflagged: k=10 original, rerank → top-3 (light)
+Flagged: k=20 original + k=10 reformulated, rerank → top-3 (deep)
+Always: all hops get deep reranking
 """
 
 import json
@@ -63,7 +63,7 @@ def dedupe_and_cap(passages, max_passages=None):
             seen.add(t)
             out.append(p)
     if max_passages and len(out) > max_passages:
-        out.sort(key=lambda p: p.get('score', 0), reverse=True)
+        out.sort(key=lambda p: p.get('rerank_score', p.get('score', 0)), reverse=True)
         out = out[:max_passages]
     return out
 
@@ -124,51 +124,56 @@ def llm_judge(client, question, gold, pred, model="gpt-4.1-mini"):
 
 
 def rerank_passages(reranker, query, passages, top_k=3):
-    """Rerank passages using cross-encoder, return top-k."""
     if not passages:
         return passages
     pairs = [(query, p.get('text', '')) for p in passages]
     scores = reranker.predict(pairs)
-    # Attach reranker scores
     for p, s in zip(passages, scores):
         p['rerank_score'] = float(s)
-    # Sort by reranker score descending, take top-k
     ranked = sorted(passages, key=lambda p: p.get('rerank_score', 0), reverse=True)
     return ranked[:top_k]
 
 
-def build_passages_rerank(retriever, reranker, sub_questions, flags, reformulator,
-                          original_question, max_passages=12):
+def build_passages_rerank_v2(retriever, reranker, sub_questions, flags, reformulator,
+                             original_question, max_passages=12):
     """
-    For each hop:
-      - Unflagged: retrieve k=3 with original query (no reranking)
-      - Flagged: retrieve k=20, rerank with cross-encoder, select top-3
-    Then dedupe and cap.
+    Refined reranking:
+    - Unflagged hops: k=10 original, rerank → top-3 (light)
+    - Flagged hops: k=20 original + k=10 reformulated, rerank → top-3 (deep)
     """
     accumulated = []
     for sq, flag in zip(sub_questions, flags):
         if flag:
-            # Deep retrieval + reranking
+            # Deep: k=20 original + k=10 reformulated
             candidates = retriever.retrieve(sq, k=20)
-            # Also try reformulated query for diversity
             try:
                 new_q = reformulator.reformulate(original_question, sq)
-                extra_candidates = retriever.retrieve(new_q, k=10)
-                # Merge and dedupe candidates
+                extra = retriever.retrieve(new_q, k=10)
                 seen = {p['text'] for p in candidates}
-                for p in extra_candidates:
+                for p in extra:
                     if p['text'] not in seen:
                         seen.add(p['text'])
                         candidates.append(p)
             except Exception:
                 pass
-            # Rerank all candidates, select top-3
             best = rerank_passages(reranker, sq, candidates, top_k=3)
             accumulated.extend(best)
         else:
-            # Standard retrieval
-            accumulated.extend(retriever.retrieve(sq, k=3))
+            # Light: k=10 original, rerank → top-3
+            candidates = retriever.retrieve(sq, k=10)
+            best = rerank_passages(reranker, sq, candidates, top_k=3)
+            accumulated.extend(best)
 
+    return dedupe_and_cap(accumulated, max_passages=max_passages)
+
+
+def build_passages_baseline_rerank(retriever, reranker, sub_questions, max_passages=12):
+    """Baseline with light reranking: k=10 per hop, rerank → top-3. No intervention."""
+    accumulated = []
+    for sq in sub_questions:
+        candidates = retriever.retrieve(sq, k=10)
+        best = rerank_passages(reranker, sq, candidates, top_k=3)
+        accumulated.extend(best)
     return dedupe_and_cap(accumulated, max_passages=max_passages)
 
 
@@ -191,14 +196,16 @@ def load_checkpoint(out_path):
 
 def compute_summary(examples, total_steps, flag_counts, passage_counts, max_passages):
     n = len(examples)
-    correct = {'baseline': 0, 'always_rerank': 0, 'deberta_rerank': 0, 'oracle_rerank': 0}
+    correct = {'baseline_rerank': 0, 'always_deep': 0, 'deberta_refined': 0, 'oracle_refined': 0}
     by_hopcount = {}
     for ex in examples:
         for c in correct:
             if ex[c]['correct']:
                 correct[c] += 1
         h = ex['n_hops']
-        s = by_hopcount.setdefault(h, {'n': 0, 'baseline': 0, 'always_rerank': 0, 'deberta_rerank': 0, 'oracle_rerank': 0})
+        s = by_hopcount.setdefault(h, {'n': 0})
+        for c in correct:
+            s.setdefault(c, 0)
         s['n'] += 1
         for c in correct:
             if ex[c]['correct']:
@@ -223,11 +230,11 @@ def main():
     parser.add_argument("--subquestions", default="results/musique_dev_subquestions.json")
     parser.add_argument("--fact_grounded", default="results/fact_grounded_final_dev.jsonl")
     parser.add_argument("--deberta_dir", default="models/deberta_fg_v2_best")
-    parser.add_argument("--output", default="results/section4_rerank.json")
+    parser.add_argument("--output", default="results/section4_rerank_v2.json")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--deberta_threshold", type=float, default=0.5)
     parser.add_argument("--max_passages", type=int, default=12)
-    parser.add_argument("--checkpoint_every", type=int, default=200)
+    parser.add_argument("--checkpoint_every", type=int, default=400)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
@@ -237,7 +244,7 @@ def main():
     reformulator = QueryReformulator()
     retriever = ESRetriever()
     reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    print("  Cross-encoder loaded")
+    print("  All components loaded")
 
     print("Loading data...")
     raw = {}
@@ -264,7 +271,7 @@ def main():
     # Resume logic
     out = []
     flag_counts = {'always': 0, 'deberta': 0, 'oracle': 0}
-    passage_counts = {'baseline': [], 'always_rerank': [], 'deberta_rerank': [], 'oracle_rerank': []}
+    passage_counts = {'baseline_rerank': [], 'always_deep': [], 'deberta_refined': [], 'oracle_refined': []}
     total_steps = 0
     completed_qids = set()
 
@@ -281,25 +288,24 @@ def main():
             print(f"Resumed: {len(completed_qids)} already done.")
 
     qids_to_run = [q for q in qids if q not in completed_qids]
-    print(f"Running rerank experiment on {len(qids_to_run)} questions (max_passages={args.max_passages})\n")
+    print(f"Running refined rerank on {len(qids_to_run)} questions (max_passages={args.max_passages})\n")
 
-    for i, qid in enumerate(tqdm(qids_to_run, desc="Rerank")):
-        d = raw[qid]
-        original_question = d['question']
-        gold = d['answer']
+    for i, qid in enumerate(tqdm(qids_to_run, desc="Rerank-v2")):
+        d_raw = raw[qid]
+        original_question = d_raw['question']
+        gold = d_raw['answer']
         sub_questions = subq_lookup[qid].get('natural_sub_questions', [])
         if not sub_questions:
             continue
         n_hops = len(sub_questions)
         oracle_for_q = oracle.get(qid, {})
 
-        # Baseline: k=3 per hop, no reranking, no intervention
-        baseline_accumulated = []
-        for sq in sub_questions:
-            baseline_accumulated.extend(retriever.retrieve(sq, k=3))
-        baseline_passages = dedupe_and_cap(baseline_accumulated, max_passages=args.max_passages)
+        # Baseline: light reranking (k=10 → top-3) per hop
+        baseline_passages = build_passages_baseline_rerank(
+            retriever, reranker, sub_questions, max_passages=args.max_passages
+        )
 
-        # Build flags
+        # Build flags using baseline passages
         oracle_flags = []
         deberta_flags = []
         passages_str = deberta_format_input(baseline_passages)
@@ -324,25 +330,29 @@ def main():
 
             flag_counts['always'] += 1
 
-        # Build passage sets with reranking
+        # Always: all hops get deep reranking
         always_flags = [True] * n_hops
-        always_passages = build_passages_rerank(
+        always_passages = build_passages_rerank_v2(
             retriever, reranker, sub_questions, always_flags, reformulator,
             original_question, max_passages=args.max_passages
         )
-        deberta_passages = build_passages_rerank(
+
+        # DeBERTa: flagged=deep, unflagged=light
+        deberta_passages = build_passages_rerank_v2(
             retriever, reranker, sub_questions, deberta_flags, reformulator,
             original_question, max_passages=args.max_passages
         )
-        oracle_passages = build_passages_rerank(
+
+        # Oracle: flagged=deep, unflagged=light
+        oracle_passages = build_passages_rerank_v2(
             retriever, reranker, sub_questions, oracle_flags, reformulator,
             original_question, max_passages=args.max_passages
         )
 
-        passage_counts['baseline'].append(len(baseline_passages))
-        passage_counts['always_rerank'].append(len(always_passages))
-        passage_counts['deberta_rerank'].append(len(deberta_passages))
-        passage_counts['oracle_rerank'].append(len(oracle_passages))
+        passage_counts['baseline_rerank'].append(len(baseline_passages))
+        passage_counts['always_deep'].append(len(always_passages))
+        passage_counts['deberta_refined'].append(len(deberta_passages))
+        passage_counts['oracle_refined'].append(len(oracle_passages))
 
         try:
             ans_baseline = run_cot_qa(client, original_question, sub_questions, baseline_passages)
@@ -367,10 +377,10 @@ def main():
             'question': original_question,
             'gold': gold,
             'n_hops': n_hops,
-            'baseline': {'answer': ans_baseline, 'correct': j_base, 'n_passages': len(baseline_passages)},
-            'always_rerank': {'answer': ans_always, 'correct': j_alw, 'n_passages': len(always_passages)},
-            'deberta_rerank': {'answer': ans_deberta, 'correct': j_deb, 'flags': deberta_flags, 'n_passages': len(deberta_passages)},
-            'oracle_rerank': {'answer': ans_oracle, 'correct': j_ora, 'flags': oracle_flags, 'n_passages': len(oracle_passages)},
+            'baseline_rerank': {'answer': ans_baseline, 'correct': j_base, 'n_passages': len(baseline_passages)},
+            'always_deep': {'answer': ans_always, 'correct': j_alw, 'n_passages': len(always_passages)},
+            'deberta_refined': {'answer': ans_deberta, 'correct': j_deb, 'flags': deberta_flags, 'n_passages': len(deberta_passages)},
+            'oracle_refined': {'answer': ans_oracle, 'correct': j_ora, 'flags': oracle_flags, 'n_passages': len(oracle_passages)},
         })
 
         if (i + 1) % args.checkpoint_every == 0:
@@ -384,7 +394,7 @@ def main():
     n = len(out)
     correct = summary['correct_counts']
     print(f"\n{'='*60}")
-    print(f"RERANK EXPERIMENT RESULTS (n={n}, max_passages={args.max_passages})")
+    print(f"REFINED RERANK RESULTS (n={n}, max_passages={args.max_passages})")
     print(f"{'='*60}")
     print(f"Total steps: {total_steps}")
     if total_steps > 0:
@@ -393,19 +403,19 @@ def main():
     print()
     print("Average passage counts:")
     for k, v in summary['avg_passage_counts'].items():
-        print(f"  {k:16s}: {v:.1f}")
+        print(f"  {k:18s}: {v:.1f}")
     print()
     print("Overall accuracy:")
-    for cond in ['baseline', 'always_rerank', 'deberta_rerank', 'oracle_rerank']:
+    for cond in ['baseline_rerank', 'always_deep', 'deberta_refined', 'oracle_refined']:
         if n > 0:
-            print(f"  {cond:16s}: {correct[cond]}/{n} = {correct[cond]/n*100:.1f}%")
+            print(f"  {cond:18s}: {correct[cond]}/{n} = {correct[cond]/n*100:.1f}%")
     print()
     print("Stratified by hop count:")
     for h in sorted(summary['stratified']):
         s = summary['stratified'][h]
         print(f"  {h}-hop (n={s['n']}):")
-        for cond in ['baseline', 'always_rerank', 'deberta_rerank', 'oracle_rerank']:
-            print(f"    {cond:16s}: {s[cond]}/{s['n']} = {s[cond]/s['n']*100:.1f}%")
+        for cond in ['baseline_rerank', 'always_deep', 'deberta_refined', 'oracle_refined']:
+            print(f"    {cond:18s}: {s.get(cond, 0)}/{s['n']} = {s.get(cond, 0)/s['n']*100:.1f}%")
     print(f"\nSaved to {args.output}")
 
 

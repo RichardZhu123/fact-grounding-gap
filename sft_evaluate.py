@@ -17,11 +17,11 @@ from collections import defaultdict
 
 # Add project to path
 sys.path.insert(0, '.')
-from simple_multihop_qa import MultiHopQA
-from deberta_inference import DeBERTaPredictor
+from simple_multihop_qa import SimpleMultiHopQA
+from deberta_inference import DebertaPredictor
 
 BASE_MODEL = "gpt-4.1-mini"
-FT_MODEL = "ft:gpt-4.1-mini-2025-04-14:personal:fact-aware:DdK9vXB1"
+FT_MODEL = "ft:gpt-4.1-mini-2025-04-14:personal:fact-aware-v3:DdUQtqZp"
 
 def run_condition(qa_engine, predictor, examples, use_deberta=False, verbose=False):
     """Run one experimental condition."""
@@ -37,13 +37,8 @@ def run_condition(qa_engine, predictor, examples, use_deberta=False, verbose=Fal
             # Build interventions dict if using DeBERTa
             interventions = {}
             if use_deberta and predictor:
-                # Run Self-Ask to get sub-questions and passages per hop,
-                # then use DeBERTa to decide which hops need intervention.
-                # For simplicity, run without intervention first to get trajectory,
-                # then re-run with interventions on flagged hops.
-                
                 # First pass: get trajectory without intervention
-                traj = qa_engine.answer_with_interventions(question)
+                traj = qa_engine.answer(question)
                 
                 # Check each hop with DeBERTa
                 for step in traj.steps:
@@ -61,11 +56,12 @@ def run_condition(qa_engine, predictor, examples, use_deberta=False, verbose=Fal
                             extra = qa_engine.retrieve(sub_q)
                             interventions[hop_num] = extra
                 
-                # Second pass: run with interventions
+                # Second pass: run with interventions if any flags
                 if interventions:
                     traj = qa_engine.answer_with_interventions(question, interventions=interventions)
+                # else: keep the first-pass traj (no flags = no intervention needed)
             else:
-                traj = qa_engine.answer_with_interventions(question)
+                traj = qa_engine.answer(question)
             
             pred = traj.final_answer
             
@@ -131,16 +127,16 @@ def main():
     predictor = None
     if any('deberta' in c for c in args.conditions):
         print("Loading DeBERTa predictor...")
-        predictor = DeBERTaPredictor('models/deberta_fg_v2_best')
+        predictor = DebertaPredictor('models/deberta_fg_v2_best')
     
     # Initialize QA engines
     engines = {}
     if any(c.startswith('base') for c in args.conditions):
         print(f"Initializing base engine: {BASE_MODEL}")
-        engines['base'] = MultiHopQA(model=BASE_MODEL)
+        engines['base'] = SimpleMultiHopQA(model=BASE_MODEL)
     if any(c.startswith('ft') for c in args.conditions):
         print(f"Initializing fine-tuned engine: {FT_MODEL}")
-        engines['ft'] = MultiHopQA(model=FT_MODEL)
+        engines['ft'] = SimpleMultiHopQA(model=FT_MODEL)
     
     # Run conditions
     all_results = {

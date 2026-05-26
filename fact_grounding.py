@@ -19,14 +19,14 @@ Labels:
 
 Usage:
     # Test on 10 examples first
-    python fact_grounding_v2.py \
+    python fact_grounding.py \
         --results results/full_run_all_4.1.json \
         --raw_data raw_data/musique/musique_ans_v1.0_dev.jsonl \
         --output results/fact_grounded_v2_test.jsonl \
         --limit 10 --stats
 
     # Full dev set (~3-4 hours, ~$10)
-    python fact_grounding_v2.py \
+    python fact_grounding.py \
         --results results/full_run_all_4.1.json \
         --raw_data raw_data/musique/musique_ans_v1.0_dev.jsonl \
         --output results/fact_grounded_v2_dev.jsonl \

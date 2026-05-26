@@ -5,7 +5,7 @@ Baseline Classifiers for Fact-Grounded Answerability
 Tests whether simple features can predict if the system's accumulated
 retrieved passages contain enough information to answer each sub-question.
 
-Uses labels from fact_grounding_final.py (ANSWERABLE / NOT-ANSWERABLE).
+Uses labels from fact_grounding.py (ANSWERABLE / NOT-ANSWERABLE).
 
 Since we don't have separate train/dev for these labels yet (only dev),
 we run leave-one-out style evaluation and also report feature correlations.
@@ -83,7 +83,7 @@ def best_threshold(values, labels, directions=[1, -1]):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Fact-grounded JSONL from fact_grounding_final.py")
+    parser.add_argument("--input", required=True, help="Fact-grounded JSONL from fact_grounding.py")
     args = parser.parse_args()
 
     examples = load_data(args.input)

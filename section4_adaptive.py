@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Section 4 ablation: Adaptive budget allocation.
-Same total budget for Always and DeBERTa, different allocation strategy.
-Budget = 4 * n_hops. Baseline underspends at k=3 per hop.
-Always: uniform k = budget/n_hops per hop.
-DeBERTa: unflagged k=3, flagged hops split remaining budget evenly.
+Section 4: Adaptive budget + hybrid re-retrieval (title-match + BM25).
+v2: Flagged hops use both reformulated BM25 AND title-match search.
+
+Budget = 4 * n_hops. Baseline k=3 per hop.
+Always: all hops flagged, budget split evenly, hybrid retrieval.
+DeBERTa: unflagged k=3 original, flagged hops get concentrated hybrid retrieval.
 """
 
 import json
 import os
+import re
 import argparse
 from tqdm import tqdm
 from openai import OpenAI
@@ -42,6 +44,12 @@ aliases, and partial matches that capture the key entity/fact. Reject answers th
 a different entity or miss the key fact.
 
 Reply with ONLY "YES" or "NO"."""
+
+
+ENTITY_EXTRACT_PROMPT = """Extract the main entity or noun phrase being asked about in this question.
+Output ONLY the entity name, nothing else.
+
+Question: {question}"""
 
 
 def format_passages(passages, max_chars=6000):
@@ -110,6 +118,38 @@ def llm_judge(client, question, gold, pred, model="gpt-4.1-mini"):
     return "YES" in resp.choices[0].message.content.strip().upper()
 
 
+def extract_entity(client, question, model="gpt-4.1-mini"):
+    """Extract the key entity from a sub-question for title-match search."""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": ENTITY_EXTRACT_PROMPT.format(question=question)}],
+        temperature=0.0,
+        max_tokens=30,
+    )
+    return resp.choices[0].message.content.strip().strip('"').strip("'")
+
+
+def title_search(es, index, entity, k=3):
+    """Search ES by title field only — for entity disambiguation."""
+    es_query = {
+        "size": k,
+        "_source": ["title", "paragraph_text"],
+        "query": {
+            "match": {"title": entity}
+        }
+    }
+    result = es.search(index=index, body=es_query)
+    passages = []
+    if result.get("hits") and result["hits"].get("hits"):
+        for hit in result["hits"]["hits"]:
+            passages.append({
+                "title": hit["_source"]["title"],
+                "text": hit["_source"]["paragraph_text"],
+                "score": hit["_score"]
+            })
+    return passages
+
+
 def build_passages_baseline(retriever, sub_questions):
     """Baseline: k=3 per hop, no intervention."""
     accumulated = []
@@ -124,33 +164,19 @@ def build_passages_baseline(retriever, sub_questions):
     return deduped
 
 
-def build_passages_always(retriever, sub_questions, budget):
-    """Always-uniform: k = budget/n_hops per hop, evenly distributed."""
-    n_hops = len(sub_questions)
-    k_per_hop = budget // n_hops
-    accumulated = []
-    for sq in sub_questions:
-        accumulated.extend(retriever.retrieve(sq, k=k_per_hop))
-    seen, deduped = set(), []
-    for p in accumulated:
-        t = p.get('text', '')
-        if t and t not in seen:
-            seen.add(t)
-            deduped.append(p)
-    return deduped
-
-
-def build_passages_adaptive(retriever, sub_questions, flags, budget, reformulator,
-                            original_question):
+def build_passages_hybrid(retriever, sub_questions, flags, budget, reformulator,
+                          original_question, client, es, index="musique"):
     """
-    DeBERTa-adaptive: unflagged hops get k=3, flagged hops split remaining budget.
-    If 0 flagged: every hop gets k=3 (underspend — conserve budget).
+    Hybrid adaptive retrieval. Used by both Always and DeBERTa.
+    Unflagged hops: k=3, original query.
+    Flagged hops: split budget between reformulated BM25 + title-match search.
+      - Half of k_flagged from reformulated full-text search
+      - Half from title-match on extracted entity
     """
     n_hops = len(sub_questions)
     n_flagged = sum(flags)
 
     if n_flagged == 0:
-        # No flags: k=3 per hop, underspend
         k_per_hop = [3] * n_hops
     else:
         extra = budget - 3 * n_hops
@@ -160,14 +186,27 @@ def build_passages_adaptive(retriever, sub_questions, flags, budget, reformulato
     accumulated = []
     for sq, flag, k in zip(sub_questions, flags, k_per_hop):
         if flag:
-            # Flagged: use reformulated query with concentrated budget
+            # Hybrid: reformulated BM25 + title-match
+            k_bm25 = (k + 1) // 2  # ceil half
+            k_title = k // 2       # floor half
+
+            # Reformulated BM25 search
             try:
                 new_q = reformulator.reformulate(original_question, sq)
-                accumulated.extend(retriever.retrieve(new_q, k=k))
+                accumulated.extend(retriever.retrieve(new_q, k=k_bm25))
             except Exception:
-                accumulated.extend(retriever.retrieve(sq, k=k))
+                accumulated.extend(retriever.retrieve(sq, k=k_bm25))
+
+            # Title-match search for key entity
+            if k_title > 0:
+                try:
+                    entity = extract_entity(client, sq)
+                    title_results = title_search(es, index, entity, k=k_title)
+                    accumulated.extend(title_results)
+                except Exception:
+                    # Fallback to regular BM25 if entity extraction fails
+                    accumulated.extend(retriever.retrieve(sq, k=k_title))
         else:
-            # Unflagged: original query, k=3
             accumulated.extend(retriever.retrieve(sq, k=k))
 
     seen, deduped = set(), []
@@ -198,14 +237,14 @@ def load_checkpoint(out_path):
 
 def compute_summary(examples, total_steps, flag_counts, passage_counts):
     n = len(examples)
-    correct = {'baseline': 0, 'always_uniform': 0, 'deberta_adaptive': 0, 'oracle_adaptive': 0}
+    correct = {'baseline': 0, 'always_hybrid': 0, 'deberta_hybrid': 0, 'oracle_hybrid': 0}
     by_hopcount = {}
     for ex in examples:
         for c in correct:
             if ex[c]['correct']:
                 correct[c] += 1
         h = ex['n_hops']
-        s = by_hopcount.setdefault(h, {'n': 0, 'baseline': 0, 'always_uniform': 0, 'deberta_adaptive': 0, 'oracle_adaptive': 0})
+        s = by_hopcount.setdefault(h, {'n': 0, 'baseline': 0, 'always_hybrid': 0, 'deberta_hybrid': 0, 'oracle_hybrid': 0})
         s['n'] += 1
         for c in correct:
             if ex[c]['correct']:
@@ -229,7 +268,7 @@ def main():
     parser.add_argument("--subquestions", default="results/musique_dev_subquestions.json")
     parser.add_argument("--fact_grounded", default="results/fact_grounded_final_dev.jsonl")
     parser.add_argument("--deberta_dir", default="models/deberta_fg_v2_best")
-    parser.add_argument("--output", default="results/section4_adaptive.json")
+    parser.add_argument("--output", default="results/section4_hybrid.json")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--deberta_threshold", type=float, default=0.5)
     parser.add_argument("--checkpoint_every", type=int, default=200)
@@ -241,6 +280,7 @@ def main():
     deberta = DebertaPredictor(args.deberta_dir)
     reformulator = QueryReformulator()
     retriever = ESRetriever()
+    es = retriever.es  # Direct ES access for title search
 
     print("Loading data...")
     raw = {}
@@ -267,7 +307,7 @@ def main():
     # Resume logic
     out = []
     flag_counts = {'always': 0, 'deberta': 0, 'oracle': 0}
-    passage_counts = {'baseline': [], 'always_uniform': [], 'deberta_adaptive': [], 'oracle_adaptive': []}
+    passage_counts = {'baseline': [], 'always_hybrid': [], 'deberta_hybrid': [], 'oracle_hybrid': []}
     total_steps = 0
     completed_qids = set()
 
@@ -284,9 +324,9 @@ def main():
             print(f"Resumed: {len(completed_qids)} already done, skipping those.")
 
     qids_to_run = [q for q in qids if q not in completed_qids]
-    print(f"Running adaptive budget experiment on {len(qids_to_run)} questions\n")
+    print(f"Running hybrid adaptive experiment on {len(qids_to_run)} questions\n")
 
-    for i, qid in enumerate(tqdm(qids_to_run, desc="Adaptive")):
+    for i, qid in enumerate(tqdm(qids_to_run, desc="Hybrid")):
         d = raw[qid]
         original_question = d['question']
         gold = d['answer']
@@ -297,7 +337,7 @@ def main():
         budget = 4 * n_hops
         oracle_for_q = oracle.get(qid, {})
 
-        # Baseline: k=3 per hop
+        # Baseline
         baseline_passages = build_passages_baseline(retriever, sub_questions)
 
         # Build flags
@@ -325,19 +365,29 @@ def main():
 
             flag_counts['always'] += 1
 
-        # Build passage sets
-        always_passages = build_passages_always(retriever, sub_questions, budget)
-        deberta_passages, deberta_k = build_passages_adaptive(
-            retriever, sub_questions, deberta_flags, budget, reformulator, original_question
+        # Always: all hops flagged
+        always_flags_list = [True] * n_hops
+        always_passages, always_k = build_passages_hybrid(
+            retriever, sub_questions, always_flags_list, budget, reformulator,
+            original_question, client, es
         )
-        oracle_passages, oracle_k = build_passages_adaptive(
-            retriever, sub_questions, oracle_flags, budget, reformulator, original_question
+
+        # DeBERTa: selective flags
+        deberta_passages, deberta_k = build_passages_hybrid(
+            retriever, sub_questions, deberta_flags, budget, reformulator,
+            original_question, client, es
+        )
+
+        # Oracle: selective flags
+        oracle_passages, oracle_k = build_passages_hybrid(
+            retriever, sub_questions, oracle_flags, budget, reformulator,
+            original_question, client, es
         )
 
         passage_counts['baseline'].append(len(baseline_passages))
-        passage_counts['always_uniform'].append(len(always_passages))
-        passage_counts['deberta_adaptive'].append(len(deberta_passages))
-        passage_counts['oracle_adaptive'].append(len(oracle_passages))
+        passage_counts['always_hybrid'].append(len(always_passages))
+        passage_counts['deberta_hybrid'].append(len(deberta_passages))
+        passage_counts['oracle_hybrid'].append(len(oracle_passages))
 
         try:
             ans_baseline = run_cot_qa(client, original_question, sub_questions, baseline_passages)
@@ -363,10 +413,10 @@ def main():
             'gold': gold,
             'n_hops': n_hops,
             'budget': budget,
-            'baseline': {'answer': ans_baseline, 'correct': j_base, 'n_passages': len(baseline_passages), 'k_per_hop': [3]*n_hops},
-            'always_uniform': {'answer': ans_always, 'correct': j_alw, 'n_passages': len(always_passages), 'k_per_hop': [budget//n_hops]*n_hops},
-            'deberta_adaptive': {'answer': ans_deberta, 'correct': j_deb, 'flags': deberta_flags, 'n_passages': len(deberta_passages), 'k_per_hop': deberta_k},
-            'oracle_adaptive': {'answer': ans_oracle, 'correct': j_ora, 'flags': oracle_flags, 'n_passages': len(oracle_passages), 'k_per_hop': oracle_k},
+            'baseline': {'answer': ans_baseline, 'correct': j_base, 'n_passages': len(baseline_passages)},
+            'always_hybrid': {'answer': ans_always, 'correct': j_alw, 'n_passages': len(always_passages), 'k_per_hop': always_k},
+            'deberta_hybrid': {'answer': ans_deberta, 'correct': j_deb, 'flags': deberta_flags, 'n_passages': len(deberta_passages), 'k_per_hop': deberta_k},
+            'oracle_hybrid': {'answer': ans_oracle, 'correct': j_ora, 'flags': oracle_flags, 'n_passages': len(oracle_passages), 'k_per_hop': oracle_k},
         })
 
         # Checkpoint
@@ -381,7 +431,7 @@ def main():
     n = len(out)
     correct = summary['correct_counts']
     print(f"\n{'='*60}")
-    print(f"ADAPTIVE BUDGET RESULTS (n={n})")
+    print(f"HYBRID ADAPTIVE RESULTS (n={n})")
     print(f"{'='*60}")
     print(f"Total steps: {total_steps}")
     print(f"Budget formula: 4 * n_hops")
@@ -394,7 +444,7 @@ def main():
         print(f"  {k:18s}: {v:.1f}")
     print()
     print("Overall accuracy:")
-    for cond in ['baseline', 'always_uniform', 'deberta_adaptive', 'oracle_adaptive']:
+    for cond in ['baseline', 'always_hybrid', 'deberta_hybrid', 'oracle_hybrid']:
         if n > 0:
             print(f"  {cond:18s}: {correct[cond]}/{n} = {correct[cond]/n*100:.1f}%")
     print()
@@ -402,7 +452,7 @@ def main():
     for h in sorted(summary['stratified']):
         s = summary['stratified'][h]
         print(f"  {h}-hop (n={s['n']}, budget={4*h}):")
-        for cond in ['baseline', 'always_uniform', 'deberta_adaptive', 'oracle_adaptive']:
+        for cond in ['baseline', 'always_hybrid', 'deberta_hybrid', 'oracle_hybrid']:
             print(f"    {cond:18s}: {s[cond]}/{s['n']} = {s[cond]/s['n']*100:.1f}%")
     print(f"\nSaved to {args.output}")
 
