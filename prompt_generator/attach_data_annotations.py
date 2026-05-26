@@ -78,7 +78,7 @@ class Retriever:
                         f"doesn't match {self._source_corpus_name}."
                     )
 
-                if (  # This was changed post-hoc to include both conditions.
+                if (  # Deduplicates on both title and text to avoid partial matches.
                     retrieval_item["title"] in selected_titles and retrieval_item["paragraph_text"] in selected_paras
                 ):
                     continue

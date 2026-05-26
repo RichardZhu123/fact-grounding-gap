@@ -30,7 +30,7 @@ class LLMQAModel:
     def ask_question(self, input_question, context, context_suffix=""):
         question_prompt = self.prompt + "\n"  # remove "\n" to remove \n\n\n delimiter.
         if context and self.add_context:
-            # TODO Hack!! Needs a better fix
+            # Handles PARA_N prefix in questions to select a specific context paragraph by index.
             m = re.match(" *PARA_([0-9]+) (.*)", input_question)
             if m:
                 assert isinstance(context, list)

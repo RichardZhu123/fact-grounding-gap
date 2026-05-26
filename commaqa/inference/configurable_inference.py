@@ -74,7 +74,7 @@ def load_config(config_file):
         ext_vars = get_environment_variables()
         # logger.info("Parsing config with external variables: {}".format(ext_vars))
 
-        # HACKY: I've to ovvride this way instead of passing the env variables for now.
+        # Variable replacements must be applied via this override path; env vars alone are not sufficient here.
         if parsed_args.variable_replacements:
             import uuid
             from run import instatiate_config

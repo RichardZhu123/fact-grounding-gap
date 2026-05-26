@@ -5,9 +5,8 @@ from elasticsearch_retriever import ElasticsearchRetriever
 
 class UnifiedRetriever:
     """
-    This class wrapper multiple different retrievers we experimented with.
-    Since we settled with Elasticsearch, I've removed code related to other
-    retrievers from here. Still keeping the wrapper for reproducibility.
+    Wrapper around the Elasticsearch retriever. Kept as a class for a consistent
+    retriever interface across the codebase.
     """
 
     def __init__(

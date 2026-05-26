@@ -233,7 +233,7 @@ class AnswerExtractor(ParticipantModel):
             if debug:
                 print("EXT: " + answer)
 
-            try:  # Hacky. Fix later. This is to handle '[\\"1,450 miles\\"]' to '["1,450 miles"]'
+            try:  # Handles unicode-escaped JSON strings, e.g. '[\\"1,450 miles\\"]' → '["1,450 miles"]'
                 json.loads(answer)
             except:
                 try:
