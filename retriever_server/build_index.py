@@ -4,6 +4,7 @@ Build ES (Elasticsearch) BM25 Index.
 
 from typing import Dict
 import json
+import ijson
 import argparse
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
@@ -71,10 +72,8 @@ def make_iirc_documents(elasticsearch_index: str, metadata: Dict = None):
 
     random.seed(13370)  # Don't change.
 
-    with open(raw_filepath, "r") as file:
-        full_data = json.load(file)
-
-        for title, page_html in tqdm(full_data.items()):
+    with open(raw_filepath, "rb") as file:
+        for title, page_html in tqdm(ijson.kvitems(file, '')):
             page_soup = BeautifulSoup(page_html, "html.parser")
             paragraph_texts = [
                 text for text in page_soup.text.split("\n") if text.strip() and len(text.strip().split()) > 10

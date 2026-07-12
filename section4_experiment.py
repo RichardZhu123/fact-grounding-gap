@@ -23,7 +23,7 @@ from openai import OpenAI
 from deberta_inference import DebertaPredictor
 from query_reformulator import QueryReformulator
 from es_retriever import ESRetriever
-
+from contriever_retriever import ContrieverRetriever
 
 COT_PROMPT = """Answer the question step by step using ONLY the passages below.
 
@@ -214,7 +214,7 @@ def main():
     client = OpenAI()
     deberta = DebertaPredictor(args.deberta_dir)
     reformulator = QueryReformulator()
-    retriever = ESRetriever()
+    retriever = ContrieverRetriever()
 
     print("Loading data...")
     raw = {}
