@@ -1,6 +1,16 @@
 import os
+import json
 
-from lib import read_jsonl, write_jsonl
+
+def read_jsonl(file_path):
+    with open(file_path, "r") as file:
+        return [json.loads(line.strip()) for line in file if line.strip()]
+
+
+def write_jsonl(instances, file_path):
+    with open(file_path, "w") as file:
+        for instance in instances:
+            file.write(json.dumps(instance) + "\n")
 
 
 def main():
